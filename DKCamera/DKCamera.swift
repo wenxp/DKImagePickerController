@@ -1,4 +1,4 @@
-//
+ //
 //  DKCamera.swift
 //  DKCameraDemo
 //
@@ -7,8 +7,10 @@
 //
 
 import UIKit
+import GLKit
 import AVFoundation
 import CoreMotion
+import ImageIO
 
 open class DKCameraPassthroughView: UIView {
     open override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
@@ -17,23 +19,42 @@ open class DKCameraPassthroughView: UIView {
     }
 }
 
-extension AVMetadataFaceObject {
-
-    open func realBounds(inPreviewLayer previewLayer: AVCaptureVideoPreviewLayer, isFront : Bool) -> CGRect {
-        var bounds = CGRect()
-        let previewSize = previewLayer.bounds.size
+extension CIFeature {
+    
+    open func bounds(onPreviewView previewView: UIView, inputImage: CIImage) -> CGRect {
+        let inputImageSize = inputImage.extent.size
+        var transform = CGAffineTransform.identity
         
-        if isFront {
-            bounds.origin = CGPoint(x: previewSize.width - previewSize.width * (1 - self.bounds.origin.y - self.bounds.size.height / 2),
-                                    y: previewSize.height * (self.bounds.origin.x + self.bounds.size.width / 2))
-        } else {
-            bounds.origin = CGPoint(x: previewSize.width * (1 - self.bounds.origin.y - self.bounds.size.height / 2),
-                                    y: previewSize.height * (self.bounds.origin.x + self.bounds.size.width / 2))
-        }
-        bounds.size = CGSize(width: self.bounds.width * previewSize.height,
-                             height: self.bounds.height * previewSize.width)
-        return bounds
+//        if inputImageSize.width > inputImageSize.height {
+//            transform = transform.scaledBy(x: -1, y: 1)
+//            transform = transform.translatedBy(x: -inputImageSize.width, y: 0)
+//        } else {
+            transform = transform.scaledBy(x: 1, y: -1)
+            transform = transform.translatedBy(x: 0, y: -inputImageSize.height)
+//        }
+        
+        let boundsOnPreview = self.bounds.applying(transform)
+        
+        let aspectRatio = previewView.bounds.width / inputImageSize.width
+        let scaleTransform = CGAffineTransform(scaleX: aspectRatio, y: aspectRatio)
+        
+        return boundsOnPreview.applying(scaleTransform)
     }
+    
+    open func convert(point: CGPoint, toPreviewView previewView: UIView, inputImage: CIImage) -> CGPoint {
+        let inputImageSize = inputImage.extent.size
+        var transform = CGAffineTransform.identity
+        transform = transform.scaledBy(x: 1, y: -1)
+        transform = transform.translatedBy(x: 0, y: -inputImageSize.height)
+        
+        let pointOnPreview = point.applying(transform)
+        
+        let aspectRatio = previewView.bounds.width / inputImageSize.width
+        let scaleTransform = CGAffineTransform(scaleX: aspectRatio, y: aspectRatio)
+        
+        return pointOnPreview.applying(scaleTransform)
+    }
+    
 }
 
 @objc
@@ -41,7 +62,7 @@ public enum DKCameraDeviceSourceType : Int {
     case front, rear
 }
 
-open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate, AVCaptureVideoDataOutputSampleBufferDelegate {
     
     open class func checkCameraPermission(_ handler: @escaping (_ granted: Bool) -> Void) {
         func hasCameraPermission() -> Bool {
@@ -63,8 +84,11 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     open var didCancel: (() -> Void)?
     open var didFinishCapturingImage: ((_ image: UIImage) -> Void)?
     
-    /// Notify the listener of the detected faces in the preview frame.
-    open var onFaceDetection: ((_ faces: [AVMetadataFaceObject]) -> Void)?
+    /// Notify the listener of the detected faces in the preview frame. This notification will be posted in a background thread
+    open var onFaceDetection: ((_ faces: [CIFeature], _ inputImage: CIImage) -> Void)?
+    
+    /// Notify the listener of the detected rectangle in the preview frame. This notification will be posted in a background thread
+    open var onRectangleDetection: ((_ rectangles: [CIFeature], _ inputImage: CIImage) -> Void)?
     
     /// Be careful this may cause the view to load prematurely.
     open var cameraOverlayView: UIView? {
@@ -100,21 +124,31 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     }
     
     open let captureSession = AVCaptureSession()
-    open var previewLayer: AVCaptureVideoPreviewLayer!
-    fileprivate var beginZoomScale: CGFloat = 1.0
-    fileprivate var zoomScale: CGFloat = 1.0
-    
-    open var currentDeviceType = DKCameraDeviceSourceType.rear
-    open var currentDevice: AVCaptureDevice?
     open var captureDeviceFront: AVCaptureDevice?
     open var captureDeviceRear: AVCaptureDevice?
-    fileprivate weak var stillImageOutput: AVCaptureStillImageOutput?
+    fileprivate weak var imageOutput: AVCaptureVideoDataOutput?
+    open var eaglContext = EAGLContext(api: .openGLES2)!
+    open var ciContext: CIContext!
+    open var previewView: GLKView!
     
-    open var contentView = UIView()
+    open var currentDevice: AVCaptureDevice?
+    open var currentDeviceType = DKCameraDeviceSourceType.rear
+    
+    fileprivate var outputImage: CIImage?
+    fileprivate var beginZoomScale: CGFloat = 1.0
+    fileprivate var zoomScale: CGFloat = 1.0
     
     open var originalOrientation: UIDeviceOrientation!
     open var currentOrientation: UIDeviceOrientation!
     open let motionManager = CMMotionManager()
+    
+    fileprivate var faceDetector: CIDetector!
+    fileprivate var lastFaceDetectionResult = false
+    
+    fileprivate var rectangleDetector: CIDetector!
+    fileprivate var lastRectangleDetectionResult = false
+    
+    open var contentView = UIView()
     
     open lazy var flashButton: UIButton = {
         let flashButton = UIButton()
@@ -125,6 +159,7 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     open var cameraSwitchButton: UIButton!
     open var captureButton: UIButton!
     
+    let layer = CALayer()
     override open func viewDidLoad() {
         super.viewDidLoad()
         
@@ -133,14 +168,21 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
         self.setupSession()
         
         self.setupMotionManager()
+        
+        layer.borderWidth = 2
+        layer.borderColor = UIColor.red.cgColor
+        self.view.layer.addSublayer(layer)
+        self.onFaceDetection = { [unowned self] (faces, inputImage) in
+            if let face = faces.first {
+                DispatchQueue.main.async {
+                    self.layer.frame = face.bounds(onPreviewView: self.previewView, inputImage: inputImage)
+                }
+            }
+        }
     }
     
     open override func viewWillAppear(_ animated: Bool) {
         super.viewWillAppear(animated)
-        
-        if !self.captureSession.isRunning {
-            self.captureSession.startRunning()
-        }
         
         if !self.motionManager.isAccelerometerActive {
             self.motionManager.startAccelerometerUpdates(to: OperationQueue.current!, withHandler: { accelerometerData, error in
@@ -159,7 +201,16 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
                 }
             })
         }
+     
+        self.updateSession(isEnable: true)
+    }
+    
+    open override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
         
+        if !self.captureSession.isRunning {
+            self.captureSession.startRunning()
+        }
     }
     
     open override func viewDidLayoutSubviews() {
@@ -167,14 +218,14 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
         
         if self.originalOrientation == nil {
             self.contentView.frame = self.view.bounds
-            self.previewLayer.frame = self.view.bounds
+            self.previewView.frame = self.view.bounds
         }
     }
     
     open override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         
-        self.stopSession()
+        self.updateSession(isEnable: false)
         self.motionManager.stopAccelerometerUpdates()
     }
     
@@ -281,14 +332,19 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     }
     
     open func setupSession() {
-        self.captureSession.sessionPreset = AVCaptureSessionPresetPhoto
+        self.captureSession.sessionPreset = AVCaptureSessionPresetHigh
         
         self.setupCurrentDevice()
         
-        let stillImageOutput = AVCaptureStillImageOutput()
-        if self.captureSession.canAddOutput(stillImageOutput) {
-            self.captureSession.addOutput(stillImageOutput)
-            self.stillImageOutput = stillImageOutput
+        let imageOutput = AVCaptureVideoDataOutput()
+        if self.captureSession.canAddOutput(imageOutput) {
+            imageOutput.videoSettings = [kCVPixelBufferPixelFormatTypeKey as AnyHashable : kCVPixelFormatType_32BGRA]
+            imageOutput.alwaysDiscardsLateVideoFrames = true
+            
+            self.captureSession.addOutput(imageOutput)
+            self.imageOutput = imageOutput
+            
+            imageOutput.setSampleBufferDelegate(self, queue: DispatchQueue(label: "SampleBufferQueue"))
         }
         
         if self.onFaceDetection != nil {
@@ -306,13 +362,21 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             }
         }
         
-        self.previewLayer = AVCaptureVideoPreviewLayer(session: self.captureSession)
-        self.previewLayer.videoGravity = AVLayerVideoGravityResizeAspectFill
-        self.previewLayer.frame = self.view.bounds
+        self.ciContext = CIContext(eaglContext: self.eaglContext, options: [kCIContextWorkingColorSpace : NSNull()])
         
-        let rootLayer = self.view.layer
-        rootLayer.masksToBounds = true
-        rootLayer.insertSublayer(self.previewLayer, at: 0)
+        self.previewView = GLKView(frame: self.view.bounds, context: self.eaglContext)
+        self.previewView.enableSetNeedsDisplay = false
+        self.previewView.drawableDepthFormat = .format24
+        self.previewView.contentScaleFactor = UIScreen.main.scale
+//        self.previewView.transform = CGAffineTransform(rotationAngle: CGFloat(M_PI / 2.0))
+        
+        self.view.insertSubview(self.previewView, at: 0)
+        
+        self.previewView.bindDrawable()
+        
+        self.faceDetector = CIDetector(ofType: CIDetectorTypeFace, context: CIContext(eaglContext: self.eaglContext))
+        
+        self.rectangleDetector = CIDetector(ofType: CIDetectorTypeRectangle, context: CIContext(eaglContext: self.eaglContext))
     }
     
     open func setupCurrentDevice() {
@@ -370,15 +434,24 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     
     // MARK: - Session
     
+    fileprivate var isStopped = false
+    
     open func startSession() {
-        if let previewLayer = self.previewLayer, let connection = previewLayer.connection {
-            connection.isEnabled = true
-        }
+        self.isStopped = false
+        
+        self.updateSession(isEnable: true)
     }
     
     open func stopSession() {
-        if let previewLayer = self.previewLayer, let connection = previewLayer.connection {
-            connection.isEnabled = false
+        self.isStopped = true
+        
+        self.updateSession(isEnable: false)
+    }
+    
+    open func updateSession(isEnable: Bool) {
+        if ((!self.isStopped) || (self.isStopped && !isEnable)),
+            let connection = self.imageOutput?.connection(withMediaType: AVMediaTypeVideo) {
+            connection.isEnabled = isEnable
         }
     }
     
@@ -394,42 +467,21 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             return
         }
         
-        if let stillImageOutput = self.stillImageOutput, !stillImageOutput.isCapturingStillImage {
+        if let didFinishCapturingImage = self.didFinishCapturingImage, var outputImage = self.outputImage {
             self.captureButton.isEnabled = false
             
-            DispatchQueue.global().async(execute: {
-                if let connection = stillImageOutput.connection(withMediaType: AVMediaTypeVideo) {
-                    
-                    connection.videoOrientation = self.currentOrientation.toAVCaptureVideoOrientation()
-                    connection.videoScaleAndCropFactor = self.zoomScale
-                    
-                    stillImageOutput.captureStillImageAsynchronously(from: connection, completionHandler: { (imageDataSampleBuffer, error) in
-                        if error == nil {
-                            let imageData = AVCaptureStillImageOutput.jpegStillImageNSDataRepresentation(imageDataSampleBuffer)
-                            
-                            if let didFinishCapturingImage = self.didFinishCapturingImage, let imageData = imageData, let takenImage = UIImage(data: imageData) {
-                                
-                                let outputRect = self.previewLayer.metadataOutputRectOfInterest(for: self.previewLayer.bounds)
-                                let takenCGImage = takenImage.cgImage!
-                                let width = CGFloat(takenCGImage.width)
-                                let height = CGFloat(takenCGImage.height)
-                                let cropRect = CGRect(x: outputRect.origin.x * width, y: outputRect.origin.y * height, width: outputRect.size.width * width, height: outputRect.size.height * height)
-                                
-                                let cropCGImage = takenCGImage.cropping(to: cropRect)
-                                let cropTakenImage = UIImage(cgImage: cropCGImage!, scale: 1, orientation: takenImage.imageOrientation)
-                                
-                                didFinishCapturingImage(cropTakenImage)
-                                
-                                self.captureButton.isEnabled = true
-                            }
-                        } else {
-                            print("error while capturing still image: \(error!.localizedDescription)", terminator: "")
-                        }
-                    })
-                }
-            })
+            DispatchQueue.global().async {
+//                outputImage = outputImage.applying(CGAffineTransform(rotationAngle: CGFloat(-M_PI / 2.0)))
+                
+                let cgImage = self.ciContext.createCGImage(outputImage, from: outputImage.extent)!
+//                let cropTakenImage = UIImage(cgImage: cgImage, scale: UIScreen.main.scale, orientation: self.currentOrientation.toImageOrientation())
+                let cropTakenImage = UIImage(cgImage: cgImage)
+                
+                didFinishCapturingImage(cropTakenImage)
+                
+                self.captureButton.isEnabled = true
+            }
         }
-        
     }
     
     // MARK: - Handles Zoom
@@ -439,10 +491,9 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             self.beginZoomScale = self.zoomScale
         } else if gesture.state == .changed {
             self.zoomScale = min(4.0, max(1.0, self.beginZoomScale * gesture.scale))
-            CATransaction.begin()
-            CATransaction.setAnimationDuration(0.025)
-            self.previewLayer.setAffineTransform(CGAffineTransform(scaleX: self.zoomScale, y: self.zoomScale))
-            CATransaction.commit()
+            try! self.currentDevice?.lockForConfiguration()
+            self.currentDevice?.videoZoomFactor = self.zoomScale
+            self.currentDevice?.unlockForConfiguration()
         }
     }
     
@@ -453,6 +504,56 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             let touchPoint = gesture.location(in: self.view)
             self.focusAtTouchPoint(touchPoint)
         }
+    }
+    
+    open func focusAtTouchPoint(_ touchPoint: CGPoint) {
+        
+        func showFocusViewAtPoint(_ touchPoint: CGPoint) {
+            
+            struct FocusView {
+                static let focusView: UIView = {
+                    let focusView = UIView()
+                    let diameter: CGFloat = 100
+                    focusView.bounds.size = CGSize(width: diameter, height: diameter)
+                    focusView.layer.borderWidth = 2
+                    focusView.layer.cornerRadius = diameter / 2
+                    focusView.layer.borderColor = UIColor.white.cgColor
+                    
+                    return focusView
+                }()
+            }
+            FocusView.focusView.transform = CGAffineTransform.identity
+            FocusView.focusView.center = touchPoint
+            self.view.addSubview(FocusView.focusView)
+            UIView.animate(withDuration: 0.7, delay: 0, usingSpringWithDamping: 0.5, initialSpringVelocity: 1.1, options: UIViewAnimationOptions(), animations: {
+                FocusView.focusView.transform = CGAffineTransform.identity.scaledBy(x: 0.6, y: 0.6)
+            }) { (Bool) -> Void in
+                FocusView.focusView.removeFromSuperview()
+            }
+        }
+        
+        if self.currentDevice == nil || self.currentDevice?.isFlashAvailable == false {
+            return
+        }
+        
+        let focusPoint = CGPoint(x: touchPoint.y / self.previewView.bounds.height, y: 1.0 - touchPoint.x / self.previewView.bounds.width)
+        
+        showFocusViewAtPoint(touchPoint)
+        
+        if let currentDevice = self.currentDevice {
+            try! currentDevice.lockForConfiguration()
+            currentDevice.focusPointOfInterest = focusPoint
+            currentDevice.exposurePointOfInterest = focusPoint
+            
+            currentDevice.focusMode = .continuousAutoFocus
+            
+            if currentDevice.isExposureModeSupported(.continuousAutoExposure) {
+                currentDevice.exposureMode = .continuousAutoExposure
+            }
+            
+            currentDevice.unlockForConfiguration()
+        }
+        
     }
     
     // MARK: - Handles Switch Camera
@@ -503,12 +604,6 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
         self.flashButton.sizeToFit()
     }
     
-    // MARK: - AVCaptureMetadataOutputObjectsDelegate
-    
-    public func captureOutput(_ captureOutput: AVCaptureOutput!, didOutputMetadataObjects metadataObjects: [Any]!, from connection: AVCaptureConnection!) {
-        self.onFaceDetection?(metadataObjects as! [AVMetadataFaceObject])
-    }
-    
     open func updateFlashMode() {
         if let currentDevice = self.currentDevice
             , currentDevice.isFlashAvailable && currentDevice.isFlashModeSupported(self.flashMode) {
@@ -516,57 +611,6 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             currentDevice.flashMode = self.flashMode
             currentDevice.unlockForConfiguration()
         }
-    }
-    
-    open func focusAtTouchPoint(_ touchPoint: CGPoint) {
-        
-        func showFocusViewAtPoint(_ touchPoint: CGPoint) {
-            
-            struct FocusView {
-                static let focusView: UIView = {
-                    let focusView = UIView()
-                    let diameter: CGFloat = 100
-                    focusView.bounds.size = CGSize(width: diameter, height: diameter)
-                    focusView.layer.borderWidth = 2
-                    focusView.layer.cornerRadius = diameter / 2
-                    focusView.layer.borderColor = UIColor.white.cgColor
-                    
-                    return focusView
-                }()
-            }
-            FocusView.focusView.transform = CGAffineTransform.identity
-            FocusView.focusView.center = touchPoint
-            self.view.addSubview(FocusView.focusView)
-            UIView.animate(withDuration: 0.7, delay: 0, usingSpringWithDamping: 0.5, initialSpringVelocity: 1.1,
-                                       options: UIViewAnimationOptions(), animations: { () -> Void in
-                                        FocusView.focusView.transform = CGAffineTransform.identity.scaledBy(x: 0.6, y: 0.6)
-            }) { (Bool) -> Void in
-                FocusView.focusView.removeFromSuperview()
-            }
-        }
-        
-        if self.currentDevice == nil || self.currentDevice?.isFlashAvailable == false {
-            return
-        }
-        
-        let focusPoint = self.previewLayer.captureDevicePointOfInterest(for: touchPoint)
-        
-        showFocusViewAtPoint(touchPoint)
-        
-        if let currentDevice = self.currentDevice {
-            try! currentDevice.lockForConfiguration()
-            currentDevice.focusPointOfInterest = focusPoint
-            currentDevice.exposurePointOfInterest = focusPoint
-            
-            currentDevice.focusMode = .continuousAutoFocus
-            
-            if currentDevice.isExposureModeSupported(.continuousAutoExposure) {
-                currentDevice.exposureMode = .continuousAutoExposure
-            }
-            
-            currentDevice.unlockForConfiguration()
-        }
-        
     }
     
     // MARK: - Handles Orientation
@@ -582,9 +626,6 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
     
     open func initialOriginalOrientationForOrientation() {
         self.originalOrientation = UIApplication.shared.statusBarOrientation.toDeviceOrientation()
-        if let connection = self.previewLayer.connection {
-            connection.videoOrientation = self.originalOrientation.toAVCaptureVideoOrientation()
-        }
     }
     
     open func updateContentLayoutForCurrentOrientation() {
@@ -603,14 +644,107 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             UIView.animate(withDuration: 0.2, animations: {
                 self.contentView.bounds.size = contentViewNewSize
                 self.contentView.transform = CGAffineTransform(rotationAngle: newAngle)
-            }) 
+            })
         } else {
             let rotateAffineTransform = CGAffineTransform.identity.rotated(by: newAngle)
             
             UIView.animate(withDuration: 0.2, animations: {
                 self.flashButton.transform = rotateAffineTransform
                 self.cameraSwitchButton.transform = rotateAffineTransform
-            }) 
+            })
+        }
+    }
+    
+    // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+    
+    public func captureOutput(_ captureOutput: AVCaptureOutput!, didOutputSampleBuffer sampleBuffer: CMSampleBuffer!, from connection: AVCaptureConnection!) {
+        let videoDisplayViewBounds = CGRect(x: 0, y: 0, width: self.previewView.drawableWidth, height: self.previewView.drawableHeight)
+        
+        // Need to shimmy this through type-hell
+        let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer)!
+        
+        var sourceImage = CIImage(cvPixelBuffer: imageBuffer)
+//        let exifAttachments =
+//            CMGetAttachment(sampleBuffer, kCGImagePropertyExifDictionary, nil);
+//        let exifAttachments2 =
+//            CMGetAttachment(sampleBuffer, kCGImagePropertyOrientation, nil);
+
+        var rotationAngle: CGFloat = 0
+        if self.captureDeviceFront == self.currentDevice {
+            rotationAngle = CGFloat(M_PI_2)
+        } else {
+            switch self.originalOrientation! {
+            case .portrait:
+                rotationAngle = CGFloat(-M_PI_2)
+            case .landscapeRight:
+                rotationAngle = CGFloat(M_PI)
+            //            rotationAngle = 0
+            default:
+                rotationAngle = 0
+            }
+        }
+    
+        sourceImage = sourceImage.applying(CGAffineTransform(rotationAngle: rotationAngle))
+        
+        // Make a rect to crop to that's the size of the view we want to display the image in
+        let cropRect = AVMakeRect(aspectRatio: CGSize(width: videoDisplayViewBounds.width, height: videoDisplayViewBounds.height), insideRect: sourceImage.extent)
+        // Crop
+        let croppedImage = sourceImage.cropping(to: cropRect)
+        // Cropping changes the origin coordinates of the cropped image, so move it back to 0
+        let outputImage = croppedImage.applying(CGAffineTransform(translationX: -croppedImage.extent.origin.x, y: -croppedImage.extent.origin.y))
+        
+//        let displayImage = outputImage.applying(CGAffineTransform(rotationAngle: rotationAngle))
+        
+        self.detectFaceIfNeeded(inputImage: outputImage)
+        self.detectRectangleIfNeeded(inputImage: outputImage)
+        
+        if self.eaglContext != EAGLContext.current() {
+            EAGLContext.setCurrent(self.eaglContext)
+        }
+        self.previewView.bindDrawable()
+        
+        // clear eagl view to grey
+        glClearColor(0.5, 0.5, 0.5, 1.0)
+        glClear(0x00004000)
+        
+        // set the blend mode to "source over" so that CI will use that
+        glEnable(0x0BE2);
+        glBlendFunc(1, 0x0303)
+        
+        self.ciContext.draw(outputImage, in: videoDisplayViewBounds, from: outputImage.extent)
+        
+        self.previewView.display()
+        
+        self.outputImage = outputImage
+    }
+    
+    func synchronized<T>(_ lock: AnyObject, _ body: () throws -> T) rethrows -> T {
+        objc_sync_enter(lock)
+        defer { objc_sync_exit(lock) }
+        return try body()
+    }
+    
+    open func detectFaceIfNeeded(inputImage: CIImage) {
+        if let onFaceDetection = self.onFaceDetection {            
+//            let faces = self.faceDetector.features(in: inputImage)
+//            let faces = self.faceDetector.features(in: inputImage, options: [CIDetectorImageOrientation : NSNumber(value: 1)])
+            let faces = self.faceDetector.features(in: inputImage, options: [CIDetectorImageOrientation : NSNumber(value: 6)])
+            if faces.count > 0 || self.lastFaceDetectionResult == true {
+                onFaceDetection(faces, inputImage)
+            }
+
+            self.lastFaceDetectionResult = faces.count > 0
+        }
+    }
+    
+    open func detectRectangleIfNeeded(inputImage: CIImage) {
+        if let onRectangleDetection = self.onRectangleDetection {
+            let rectangles = self.rectangleDetector.features(in: inputImage)
+            if rectangles.count > 0 || self.lastRectangleDetectionResult == true {
+                onRectangleDetection(rectangles, inputImage)
+            }
+            
+            self.lastRectangleDetectionResult = rectangles.count > 0
         }
     }
     
@@ -650,6 +784,21 @@ public extension UIDeviceOrientation {
             return .landscapeRight
         default:
             return .portrait
+        }
+    }
+    
+    func toImageOrientation() -> UIImageOrientation {
+        switch self {
+        case .portrait:
+            return .up
+        case .portraitUpsideDown:
+            return .down
+        case .landscapeRight:
+            return .right
+        case .landscapeLeft:
+            return .left
+        default:
+            return .up
         }
     }
     
