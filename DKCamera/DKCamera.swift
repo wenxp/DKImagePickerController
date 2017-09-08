@@ -441,8 +441,12 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
                                 let cropRect = CGRect(x: outputRect.origin.x * width, y: outputRect.origin.y * height, width: outputRect.size.width * width, height: outputRect.size.height * height)
                                 
                                 let cropCGImage = takenCGImage.cropping(to: cropRect)
-                                let cropTakenImage = UIImage(cgImage: cropCGImage!, scale: 1, orientation: takenImage.imageOrientation)
-                                
+                                var cropTakenImage = UIImage(cgImage: cropCGImage!, scale: 1, orientation: takenImage.imageOrientation)
+
+                                if cropTakenImage.size.width < 2048 {
+                                    cropTakenImage = self.resizeImage(cropTakenImage, scaleSize: 2048.0/cropTakenImage.size.width)
+                                }
+
                                 didFinishCapturingImage(cropTakenImage, imageData)
                                 
                                 self.captureButton.isEnabled = true
@@ -455,6 +459,17 @@ open class DKCamera: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
             })
         }
         
+    }
+
+    func resizeImage(_ image: UIImage, scaleSize: CGFloat) -> UIImage {
+        let reSize = CGSize(width: image.size.width * scaleSize, height: image.size.height * scaleSize)
+        UIGraphicsBeginImageContext(reSize)
+        image.draw(in: CGRect(x: 0, y: 0, width: reSize.width, height: reSize.height))
+
+        let newImage = UIGraphicsGetImageFromCurrentImageContext()
+        UIGraphicsEndImageContext()
+
+        return newImage!
     }
     
     // MARK: - Handles Zoom

@@ -474,6 +474,23 @@ open class DKImagePickerController : UINavigationController {
         if let image = image {
             imageData = UIImageJPEGRepresentation(image, 1)!
         }
+
+        //修改exif信息
+        var curMetadata: Dictionary<AnyHashable, Any>?
+        if let currentSource = CGImageSourceCreateWithData(imageData as CFData, nil) {
+            curMetadata = CGImageSourceCopyPropertiesAtIndex(currentSource, 0, nil) as? Dictionary<AnyHashable, Any>
+        }
+        let curTiffDict = curMetadata?["{TIFF}"] as? NSDictionary
+
+        let tiffDict = metadata?["{TIFF}"] as? NSDictionary
+
+        var mTiffDict = tiffDict?.mutableCopy() as? NSMutableDictionary
+
+        if let dict = curTiffDict {
+            mTiffDict?[kCGImagePropertyTIFFOrientation] = dict[kCGImagePropertyTIFFOrientation]
+        }
+        metadata?[kCGImagePropertyOrientation as AnyHashable] = curMetadata?[kCGImagePropertyOrientation as AnyHashable]
+        metadata?[kCGImagePropertyTIFFDictionary as AnyHashable] = mTiffDict
         
         if #available(iOS 9.0, *) {
             if let metadata = metadata {
