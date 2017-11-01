@@ -29,6 +29,12 @@ public class DKGroupDataManager: DKBaseManager, PHPhotoLibraryChangeObserver {
 	public var assetFetchOptions: PHFetchOptions?
 	public var showsEmptyAlbums: Bool = true
 
+    //图片大小限制
+    //图片最小宽度限制，默认值为0表示不做限制
+    public var imageMinWidth: Int = 0
+    //图片最小高度限制,默认值为0表示不做限制
+    public var imageMinHeight: Int = 0
+
     public var assetFilter: ((_ asset: PHAsset) -> Bool)?
 	
 	deinit {
@@ -158,7 +164,15 @@ public class DKGroupDataManager: DKBaseManager, PHPhotoLibraryChangeObserver {
         var filtered = [PHAsset]()
         for i in 0..<fetchResult.count {
             if filter(fetchResult[i]) {
-                filtered.append(fetchResult[i])
+                if imageMinWidth == 0,
+                    imageMinHeight == 0 {
+
+                    filtered.append(fetchResult[i])
+                }else if fetchResult[i].pixelWidth >= imageMinWidth,
+                    fetchResult[i].pixelHeight >= imageMinHeight{
+                    filtered.append(fetchResult[i])
+                }
+
             }
         }
 

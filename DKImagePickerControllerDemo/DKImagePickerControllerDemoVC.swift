@@ -26,7 +26,11 @@ class DKImagePickerControllerDemoVC: UITableViewController {
         case "Pick Photos Only":
             let pickerController = DKImagePickerController()
             pickerController.assetType = .allPhotos
-            
+            pickerController.assetFilter = { ph in
+                return true
+            }
+            pickerController.imageMinWidth = 2048
+            pickerController.imageMinHeight = 1536
             destination.pickerController = pickerController
             
         case "Pick Videos Only":

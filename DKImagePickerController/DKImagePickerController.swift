@@ -168,6 +168,19 @@ open class DKImagePickerController : UINavigationController {
             getImageManager().groupDataManager.assetFetchOptions = self.createAssetFetchOptions()
         }
     }
+    //图片大小限制
+    //图片最小宽度限制，默认值为0表示不做限制
+    public var imageMinWidth: Int = 0 {
+        didSet{
+            getImageManager().groupDataManager.imageMinWidth = self.imageMinWidth
+        }
+    }
+    //图片最小高度限制,默认值为0表示不做限制
+    public var imageMinHeight: Int = 0 {
+        didSet{
+            getImageManager().groupDataManager.imageMinHeight = self.imageMinHeight
+        }
+    }
     
     /// The predicate applies to images only.
     public var imageFetchPredicate: NSPredicate? {
